@@ -15,6 +15,11 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 Maintainer: Michael Coracin
 */
 
+// Version fusionnée : mode normal (serveur) ou mode auto-DL continu
+// Usage :
+//   ./lora_pkt_fwd                                       -> mode normal
+//   ./lora_pkt_fwd -a [power] [sf] [freq] [size]        -> mode auto-DL
+//   ./lora_pkt_fwd --auto-dl [power] [sf] [freq] [size]  -> mode auto-DL
 
 /* -------------------------------------------------------------------------- */
 /* --- DEPENDANCIES --------------------------------------------------------- */
@@ -233,6 +238,13 @@ static struct lgw_tx_gain_lut_s txlut; /* TX gain table */
 static uint32_t tx_freq_min[LGW_RF_CHAIN_NB]; /* lowest frequency supported by TX chain */
 static uint32_t tx_freq_max[LGW_RF_CHAIN_NB]; /* highest frequency supported by TX chain */
 
+/* -------------------- AUTO-DL PARAMETERS -------------------- */
+static bool     auto_dl_mode      = false;           /* false = normal, true = auto-DL */
+static int      auto_rf_power     = 14;              /* default 14 dBm      */
+static uint32_t auto_datarate     = DR_LORA_SF7;     /* default SF7         */
+static uint32_t auto_freq_hz      = 868100000;       /* default 868.1 MHz   */
+static uint16_t auto_payload_size = 255;             /* default 255 octets  */
+
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
 
@@ -253,6 +265,7 @@ static void gps_process_coords(void);
 /* threads */
 void thread_up(void);
 void thread_down(void);
+void thread_down_auto_dl(void);
 void thread_gps(void);
 void thread_valid(void);
 void thread_jit(void);
@@ -268,6 +281,30 @@ static void sig_handler(int sigio) {
         exit_sig = true;
     }
     return;
+}
+
+static const char* sf_to_str(uint32_t datarate) {
+    switch (datarate) {
+        case DR_LORA_SF7:  return "SF7";
+        case DR_LORA_SF8:  return "SF8";
+        case DR_LORA_SF9:  return "SF9";
+        case DR_LORA_SF10: return "SF10";
+        case DR_LORA_SF11: return "SF11";
+        case DR_LORA_SF12: return "SF12";
+        default: return "unknown";
+    }
+}
+
+static int sf_to_int(uint32_t datarate) {
+    switch (datarate) {
+        case DR_LORA_SF7:  return 7;
+        case DR_LORA_SF8:  return 8;
+        case DR_LORA_SF9:  return 9;
+        case DR_LORA_SF10: return 10;
+        case DR_LORA_SF11: return 11;
+        case DR_LORA_SF12: return 12;
+        default: return 0;
+    }
 }
 
 static int parse_SX1301_configuration(const char * conf_file) {
@@ -970,11 +1007,166 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
     return send(sock_down, (void *)buff_ack, buff_index, 0);
 }
 
+
+/* --------- CSV LOGGING --------- */
+static FILE *log_file = NULL;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t pkt_counter = 0;
+
+static const char *ftype_str[] = {
+    "JoinReq", "JoinAccept", "UnconfDataUp", "UnconfDataDown",
+    "ConfDataUp", "ConfDataDown", "RFU", "Proprietary"
+};
+
+static void log_csv_header(void) {
+    if (log_file) {
+        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,frame_type,dev_addr,payload_hex\n");
+        fflush(log_file);
+    }
+}
+
+static void log_packet_csv(const char *direction, double freq_mhz, int sf, int rf_power,
+                           float rssi, float snr, int size, const char *crc_status,
+                           const uint8_t *payload, int payload_size) {
+    if (!log_file) return;
+
+    /* Horodatage */
+    char time_str[64];
+    struct timespec ts;
+    struct tm tm_info;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    gmtime_r(&ts.tv_sec, &tm_info);
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+             ts.tv_nsec / 1000000);
+
+    /* Frame type + DevAddr */
+    const char *frame_type = "UNKNOWN";
+    uint32_t dev_addr = 0;
+    if (payload && payload_size > 0) {
+        uint8_t ftype_val = (payload[0] >> 5) & 0x07;
+        frame_type = ftype_str[ftype_val];
+        /* DevAddr present dans les data frames (ftype 2,3,4,5) */
+        if (payload_size >= 5 && (ftype_val >= 2 && ftype_val <= 5)) {
+            dev_addr = (uint32_t)payload[1]
+                     | ((uint32_t)payload[2] << 8)
+                     | ((uint32_t)payload[3] << 16)
+                     | ((uint32_t)payload[4] << 24);
+        }
+    }
+
+    /* Payload hex */
+    char hex_payload[1024] = "";
+    int hex_len = 0;
+    if (payload && payload_size > 0) {
+        for (int j = 0; j < payload_size && hex_len < (int)sizeof(hex_payload) - 3; j++) {
+            hex_len += snprintf(hex_payload + hex_len, sizeof(hex_payload) - hex_len, "%02X", payload[j]);
+        }
+    }
+
+    pthread_mutex_lock(&log_mutex);
+    pkt_counter++;
+    fprintf(log_file, "%u,%s,%s,%.3f,%d,%d,%.1f,%.1f,%d,%s,%s,%08X,%s\n",
+            pkt_counter, time_str, direction, freq_mhz, sf, rf_power,
+            rssi, snr, size, crc_status, frame_type, dev_addr, hex_payload);
+    fflush(log_file);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+
 /* -------------------------------------------------------------------------- */
 /* --- MAIN FUNCTION -------------------------------------------------------- */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* ============================================================ */
+    /* === PARSE CLI: [-a|--auto-dl] [power] [sf] [freq] [size] === */
+    /* ============================================================ */
+    int arg_offset = 1; /* index du premier argument positionnel */
+
+    /* --- HELP --- */
+if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+    printf("\n");
+    printf("=== LoRa Packet Forwarder (dual-mode) ===\n");
+    printf("\n");
+    printf("Usage:\n");
+    printf("  %s                                          -> mode normal (server-driven downlinks)\n", argv[0]);
+    printf("  %s -a [power] [sf] [freq] [size]           -> mode auto-DL (continuous random DL)\n", argv[0]);
+    printf("  %s --auto-dl [power] [sf] [freq] [size]    -> mode auto-DL (continuous random DL)\n", argv[0]);
+    printf("  %s -h | --help                              -> this help\n", argv[0]);
+    printf("\n");
+    printf("Auto-DL parameters (all optional, positional):\n");
+    printf("  power   TX power in dBm          [0 - 27]              default: 14\n");
+    printf("  sf      Spreading Factor          [7 - 12]              default: 7\n");
+    printf("  freq    TX frequency in Hz        [863000000 - 870000000]  default: 868100000\n");
+    printf("  size    Payload size in bytes      [1 - 255]              default: 255\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s                              # normal mode\n", argv[0]);
+    printf("  %s -a                           # auto-DL, all defaults\n", argv[0]);
+    printf("  %s -a 20 12 869525000 50        # 20 dBm, SF12, 869.525 MHz, 50 bytes\n", argv[0]);
+    printf("  %s --auto-dl 14 7 868100000 100 # 14 dBm, SF7, 868.1 MHz, 100 bytes\n", argv[0]);
+    printf("\n");
+    exit(EXIT_SUCCESS);
+}
+
+/* --- AUTO-DL flag --- */
+if (argc >= 2 && (strcmp(argv[1], "-a") == 0 || strcmp(argv[1], "--auto-dl") == 0)) {
+    auto_dl_mode = true;
+    arg_offset = 2;
+}
+
+/* --- Parse auto-DL parameters --- */
+if (auto_dl_mode) {
+    if (argc >= arg_offset + 1) {
+        int pw = atoi(argv[arg_offset]);
+        if (pw >= 0 && pw <= 27) {
+            auto_rf_power = pw;
+        } else {
+            MSG("WARNING: rf_power %d hors limites [0-27], utilisation de %d\n", pw, auto_rf_power);
+        }
+    }
+    if (argc >= arg_offset + 2) {
+        int sf = atoi(argv[arg_offset + 1]);
+        switch (sf) {
+            case 7:  auto_datarate = DR_LORA_SF7;  break;
+            case 8:  auto_datarate = DR_LORA_SF8;  break;
+            case 9:  auto_datarate = DR_LORA_SF9;  break;
+            case 10: auto_datarate = DR_LORA_SF10; break;
+            case 11: auto_datarate = DR_LORA_SF11; break;
+            case 12: auto_datarate = DR_LORA_SF12; break;
+            default:
+                MSG("WARNING: SF%d invalide [7-12], utilisation de SF7\n", sf);
+                break;
+        }
+    }
+    if (argc >= arg_offset + 3) {
+        uint32_t fhz = (uint32_t)strtoul(argv[arg_offset + 2], NULL, 10);
+        if (fhz >= 863000000 && fhz <= 870000000) {
+            auto_freq_hz = fhz;
+        } else {
+            MSG("WARNING: freq %u hors bande EU868 [863000000-870000000], utilisation de %u\n", fhz, auto_freq_hz);
+        }
+    }
+    if (argc >= arg_offset + 4) {
+        int sz = atoi(argv[arg_offset + 3]);
+        if (sz >= 1 && sz <= 255) {
+            auto_payload_size = (uint16_t)sz;
+        } else {
+            MSG("WARNING: payload_size %d hors limites [1-255], utilisation de %u\n", sz, auto_payload_size);
+        }
+    }
+
+    MSG("INFO: *** CONTINUOUS AUTO-DL MODE ***\n");
+    MSG("INFO: Auto-DL config: rf_power=%d dBm, SF%d, freq=%u Hz, payload_size=%u bytes\n",
+        auto_rf_power, sf_to_int(auto_datarate), auto_freq_hz, auto_payload_size);
+} else {
+    MSG("INFO: *** NORMAL MODE (server-driven downlinks) ***\n");
+}
+  
+    MSG("INFO: Usage: ./lora_pkt_fwd [-a|--auto-dl] [rf_power] [sf] [freq_hz] [payload_size]\n");
+
     struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
     int i; /* loop variable and temporary variable for return value */
     int x;
@@ -1199,17 +1391,36 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
+    /* Ouvrir le fichier CSV de logging */
+    log_file = fopen("gateway_log.csv", "a");
+    if (log_file) {
+        fseek(log_file, 0, SEEK_END);
+        if (ftell(log_file) == 0) {
+            log_csv_header();
+        }
+        MSG("INFO: CSV logging enabled -> gateway_log.csv\n");
+    } else {
+        MSG("WARNING: Failed to open gateway_log.csv for logging\n");
+    }
+
     /* spawn threads to manage upstream and downstream */
     i = pthread_create( &thrid_up, NULL, (void * (*)(void *))thread_up, NULL);
     if (i != 0) {
         MSG("ERROR: [main] impossible to create upstream thread\n");
         exit(EXIT_FAILURE);
     }
-    i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
+
+    /* Launch appropriate downstream thread based on mode */
+    if (auto_dl_mode) {
+        i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down_auto_dl, NULL);
+    } else {
+        i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
+    }
     if (i != 0) {
         MSG("ERROR: [main] impossible to create downstream thread\n");
         exit(EXIT_FAILURE);
     }
+
     i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))thread_jit, NULL);
     if (i != 0) {
         MSG("ERROR: [main] impossible to create JIT thread\n");
@@ -1349,6 +1560,10 @@ int main(void)
         printf("# PUSH_DATA datagrams sent: %u (%u bytes)\n", cp_up_dgram_sent, cp_up_network_byte);
         printf("# PUSH_DATA acknowledged: %.2f%%\n", 100.0 * up_ack_ratio);
         printf("### [DOWNSTREAM] ###\n");
+        if (auto_dl_mode) {
+            printf("# MODE: AUTO-DL (continuous, freq=%u, %s, pw=%d, size=%u)\n",
+                   auto_freq_hz, sf_to_str(auto_datarate), auto_rf_power, auto_payload_size);
+        }
         printf("# PULL_DATA sent: %u (%.2f%% acknowledged)\n", cp_dw_pull_sent, 100.0 * dw_ack_ratio);
         printf("# PULL_RESP(onse) datagrams received: %u (%u bytes)\n", cp_dw_dgram_rcv, cp_dw_network_byte);
         printf("# RF packets sent to concentrator: %u (%u bytes)\n", (cp_nb_tx_ok+cp_nb_tx_fail), cp_dw_payload_byte);
@@ -1433,6 +1648,11 @@ int main(void)
         } else {
             MSG("WARNING: failed to stop concentrator successfully\n");
         }
+    }
+
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
     }
 
     MSG("INFO: Exiting packet forwarder program\n");
@@ -1586,6 +1806,33 @@ void thread_up(void) {
             meas_up_pkt_fwd += 1;
             meas_up_payload_byte += p->size;
             pthread_mutex_unlock(&mx_meas_up);
+
+            /* --- CSV LOG UPLINK --- */
+            {
+                const char *crc_str;
+                switch (p->status) {
+                    case STAT_CRC_OK:  crc_str = "OK"; break;
+                    case STAT_CRC_BAD: crc_str = "BAD"; break;
+                    case STAT_NO_CRC:  crc_str = "NO_CRC"; break;
+                    default:           crc_str = "UNKNOWN"; break;
+                }
+                int sf_val = 0;
+                if (p->modulation == MOD_LORA) {
+                    sf_val = (int)p->datarate;
+                }
+                log_packet_csv(
+                    "UP",
+                    (double)p->freq_hz / 1e6,
+                    sf_val,
+                    0,              /* rf_power : N/A pour uplink */
+                    p->rssi,
+                    p->snr,
+                    (int)p->size,
+                    crc_str,
+                    p->payload,
+                    (int)p->size
+                );
+            }
 
             /* Start of packet, add inter-packet separator if necessary */
             if (pkt_in_dgram == 0) {
@@ -1882,6 +2129,7 @@ void thread_up(void) {
 
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 2: POLLING SERVER AND ENQUEUING PACKETS IN JIT QUEUE ---------- */
+/* --- (NORMAL MODE) -------------------------------------------------------- */
 
 void thread_down(void) {
     int i; /* loop variables */
@@ -2097,7 +2345,7 @@ void thread_down(void) {
 
                     /* compute GPS time for next beacon to come      */
                     /*   LoRaWAN: T = k*beacon_period + TBeaconDelay */
-                    /*            with TBeaconDelay = [1.5ms +/- 1µs]*/
+                    /*            with TBeaconDelay = [1.5ms +/- 1us]*/
                     if (last_beacon_gps_time.tv_sec == 0) {
                         /* if no beacon has been queued, get next slot from current GPS time */
                         diff_beacon_time = time_reference_gps.gps.tv_sec % ((time_t)beacon_period);
@@ -2547,6 +2795,95 @@ void thread_down(void) {
     MSG("\nINFO: End of downstream thread\n");
 }
 
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 2-bis: CONTINUOUS RANDOM DOWNLINK (AUTO-DL MODE) -------------- */
+
+void thread_down_auto_dl(void) {
+    int send_result;
+    struct lgw_pkt_tx_s txpkt_auto;
+    uint32_t auto_pkt_count = 0;
+    int k;
+
+    /* JIT queue initialization (needed for thread_jit) */
+    jit_queue_init(&jit_queue);
+
+    /* Seed random generator */
+    srand((unsigned int)time(NULL));
+
+    MSG("INFO: [down] *** CONTINUOUS AUTO-DL MODE STARTED ***\n");
+    MSG("INFO: [down] freq=%u Hz, power=%d dBm, %s, payload=%u bytes\n",
+        auto_freq_hz, auto_rf_power, sf_to_str(auto_datarate), auto_payload_size);
+
+    while (!exit_sig && !quit_sig) {
+
+        /* Prepare packet in IMMEDIATE mode */
+        memset(&txpkt_auto, 0, sizeof(txpkt_auto));
+        txpkt_auto.freq_hz    = auto_freq_hz;
+        txpkt_auto.tx_mode    = IMMEDIATE;
+        txpkt_auto.rf_chain   = 0;
+        txpkt_auto.rf_power   = auto_rf_power;
+        txpkt_auto.modulation = MOD_LORA;
+        txpkt_auto.bandwidth  = BW_125KHZ;
+        txpkt_auto.datarate   = auto_datarate;
+        txpkt_auto.coderate   = CR_LORA_4_5;
+        txpkt_auto.invert_pol = true;
+        txpkt_auto.preamble   = 8;
+        txpkt_auto.no_crc     = false;
+        txpkt_auto.no_header  = false;
+
+        /* Fill payload with random bytes */
+        for (k = 0; k < (int)auto_payload_size; k++) {
+            txpkt_auto.payload[k] = (uint8_t)(rand() % 256);
+        }
+        txpkt_auto.size = auto_payload_size;
+
+        /* Send IMMEDIATELY (bypass JIT queue) */
+        pthread_mutex_lock(&mx_concent);
+        send_result = lgw_send(txpkt_auto);
+        pthread_mutex_unlock(&mx_concent);
+
+        auto_pkt_count++;
+
+        if (send_result == LGW_HAL_SUCCESS) {
+            MSG("INFO: [down] AUTO-DL #%u sent (freq=%u, %s, pw=%d, size=%u)\n",
+                auto_pkt_count, auto_freq_hz, sf_to_str(auto_datarate),
+                auto_rf_power, auto_payload_size);
+
+            pthread_mutex_lock(&mx_meas_dw);
+            meas_nb_tx_ok += 1;
+            pthread_mutex_unlock(&mx_meas_dw);
+
+            /* CSV log */
+            {
+                int sf_val = sf_to_int(auto_datarate);
+                log_packet_csv(
+                    "AUTO_DL",
+                    (double)txpkt_auto.freq_hz / 1e6,
+                    sf_val,
+                    (int)txpkt_auto.rf_power,
+                    0.0f, 0.0f,
+                    (int)txpkt_auto.size,
+                    "N/A",
+                    txpkt_auto.payload,
+                    (int)txpkt_auto.size
+                );
+            }
+        } else {
+            MSG("WARNING: [down] AUTO-DL #%u FAILED (lgw_send err=%d)\n",
+                auto_pkt_count, send_result);
+
+            pthread_mutex_lock(&mx_meas_dw);
+            meas_nb_tx_fail += 1;
+            pthread_mutex_unlock(&mx_meas_dw);
+        }
+
+        wait_ms(300);
+    }
+    MSG("\nINFO: End of auto-DL downstream thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+
 void print_tx_status(uint8_t tx_status) {
     switch (tx_status) {
         case TX_OFF:
@@ -2594,7 +2931,7 @@ void thread_jit(void) {
                 if (jit_result == JIT_ERROR_OK) {
                     /* update beacon stats */
                     if (pkt_type == JIT_PKT_TYPE_BEACON) {
-                        /* Compensate breacon frequency with xtal error */
+                        /* Compensate beacon frequency with xtal error */
                         pthread_mutex_lock(&mx_xcorr);
                         pkt.freq_hz = (uint32_t)(xtal_correct * (double)pkt.freq_hz);
                         MSG_DEBUG(DEBUG_BEACON, "beacon_pkt.freq_hz=%u (xtal_correct=%.15lf)\n", pkt.freq_hz, xtal_correct);
@@ -2641,6 +2978,27 @@ void thread_jit(void) {
                         meas_nb_tx_ok += 1;
                         pthread_mutex_unlock(&mx_meas_dw);
                         MSG_DEBUG(DEBUG_PKT_FWD, "lgw_send done: count_us=%u\n", pkt.count_us);
+
+                        /* --- CSV LOG DOWNLINK --- */
+                        {
+                            int sf_val = 0;
+                            if (pkt.modulation == MOD_LORA) {
+                                sf_val = (int)pkt.datarate;
+                            }
+                            log_packet_csv(
+                                "DOWN",
+                                (double)pkt.freq_hz / 1e6,
+                                sf_val,
+                                (int)pkt.rf_power,
+                                0.0f,           /* rssi : N/A pour downlink */
+                                0.0f,           /* snr  : N/A pour downlink */
+                                (int)pkt.size,
+                                "N/A",
+                                pkt.payload,
+                                (int)pkt.size
+                            );
+                        }
+
                     }
                 } else {
                     MSG("ERROR: jit_dequeue failed with %d\n", jit_result);
@@ -2817,18 +3175,6 @@ void thread_valid(void) {
     double init_acc = 0.0;
     double x;
 
-    /* correction debug */
-    // FILE * log_file = NULL;
-    // time_t now_time;
-    // char log_name[64];
-
-    /* initialization */
-    // time(&now_time);
-    // strftime(log_name,sizeof log_name,"xtal_err_%Y%m%dT%H%M%SZ.csv",localtime(&now_time));
-    // log_file = fopen(log_name, "w");
-    // setbuf(log_file, NULL);
-    // fprintf(log_file,"\"xtal_correct\",\"XERR_INIT_AVG %u XERR_FILT_COEF %u\"\n", XERR_INIT_AVG, XERR_FILT_COEF); // DEBUG
-
     /* main loop task */
     while (!exit_sig && !quit_sig) {
         wait_ms(1000);
@@ -2841,7 +3187,6 @@ void thread_valid(void) {
             gps_ref_valid = true;
             ref_valid_local = true;
             xtal_err_cpy = time_reference_gps.xtal_err;
-            //printf("XTAL err: %.15lf (1/XTAL_err:%.15lf)\n", xtal_err_cpy, 1/xtal_err_cpy); // DEBUG
         } else {
             /* time ref is too old, invalidate */
             gps_ref_valid = false;
@@ -2867,21 +3212,17 @@ void thread_valid(void) {
                 /* initial average calculation */
                 pthread_mutex_lock(&mx_xcorr);
                 xtal_correct = (double)(XERR_INIT_AVG) / init_acc;
-                //printf("XERR_INIT_AVG=%d, init_acc=%.15lf\n", XERR_INIT_AVG, init_acc);
                 xtal_correct_ok = true;
                 pthread_mutex_unlock(&mx_xcorr);
                 ++init_cpt;
-                // fprintf(log_file,"%.18lf,\"average\"\n", xtal_correct); // DEBUG
             } else {
                 /* tracking with low-pass filter */
                 x = 1 / xtal_err_cpy;
                 pthread_mutex_lock(&mx_xcorr);
                 xtal_correct = xtal_correct - xtal_correct/XERR_FILT_COEF + x/XERR_FILT_COEF;
                 pthread_mutex_unlock(&mx_xcorr);
-                // fprintf(log_file,"%.18lf,\"track\"\n", xtal_correct); // DEBUG
             }
         }
-        // printf("Time ref: %s, XTAL correct: %s (%.15lf)\n", ref_valid_local?"valid":"invalid", xtal_correct_ok?"valid":"invalid", xtal_correct); // DEBUG
     }
     MSG("\nINFO: End of validation thread\n");
 }
