@@ -52,7 +52,7 @@ Fork of Semtech's [packet_forwarder](https://github.com/Lora-net/packet_forwarde
 
 The file gateway_log.csv is automatically created in the working directory.
 
-##Warning
+## Warning
 
 ⚠️ Auto-DL mode transmits continuously on the EU868 band. Comply with local regulations regarding duty-cycle and transmission power limits. This mode is intended for testing in controlled environments only.
 
