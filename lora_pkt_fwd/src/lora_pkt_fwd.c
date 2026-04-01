@@ -1818,7 +1818,7 @@ void thread_up(void) {
                 }
                 int sf_val = 0;
                 if (p->modulation == MOD_LORA) {
-                    sf_val = (int)p->datarate;
+                    sf_val = sf_to_int(p->datarate);
                 }
                 log_packet_csv(
                     "UP",
