@@ -1020,13 +1020,14 @@ static const char *ftype_str[] = {
 
 static void log_csv_header(void) {
     if (log_file) {
-        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,frame_type,dev_addr,payload_hex\n");
+        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,rf_chain,if_chain,frame_type,dev_addr,payload_hex\n");
         fflush(log_file);
     }
 }
 
 static void log_packet_csv(const char *direction, double freq_mhz, int sf, int rf_power,
                            float rssi, float snr, int size, const char *crc_status,
+                           int rf_chain, int if_chain,
                            const uint8_t *payload, int payload_size) {
     if (!log_file) return;
 
@@ -1829,6 +1830,8 @@ void thread_up(void) {
                     p->snr,
                     (int)p->size,
                     crc_str,
+                    (int)p->rf_chain,      /* 0 = radio_0, 1 = radio_1 */
+                    (int)p->if_chain,      /* 0-9 = numéro démodulateur */
                     p->payload,
                     (int)p->size
                 );
@@ -2864,6 +2867,8 @@ void thread_down_auto_dl(void) {
                     0.0f, 0.0f,
                     (int)txpkt_auto.size,
                     "N/A",
+                    (int)txpkt_auto.rf_chain,  /* toujours radio_0 en TX */
+                    -1,                         /* -1 = N/A pour TX */
                     txpkt_auto.payload,
                     (int)txpkt_auto.size
                 );
@@ -2994,6 +2999,8 @@ void thread_jit(void) {
                                 0.0f,           /* snr  : N/A pour downlink */
                                 (int)pkt.size,
                                 "N/A",
+                                (int)pkt.rf_chain,     /* toujours radio_0 en TX */
+                                -1,                     /* -1 = N/A pour TX */
                                 pkt.payload,
                                 (int)pkt.size
                             );
