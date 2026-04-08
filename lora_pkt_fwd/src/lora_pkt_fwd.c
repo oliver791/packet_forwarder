@@ -1020,7 +1020,7 @@ static const char *ftype_str[] = {
 
 static void log_csv_header(void) {
     if (log_file) {
-        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,rf_chain,if_chain,frame_type,dev_addr,payload_hex\n");
+        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,radio,demodulator,frame_type,dev_addr,payload_hex\n");
         fflush(log_file);
     }
 }
@@ -1068,9 +1068,9 @@ static void log_packet_csv(const char *direction, double freq_mhz, int sf, int r
 
     pthread_mutex_lock(&log_mutex);
     pkt_counter++;
-    fprintf(log_file, "%u,%s,%s,%.3f,%d,%d,%.1f,%.1f,%d,%s,%s,%08X,%s\n",
+    fprintf(log_file, "%u,%s,%s,%.3f,%d,%d,%.1f,%.1f,%d,%s,%d,%d,%s,%08X,%s\n",
             pkt_counter, time_str, direction, freq_mhz, sf, rf_power,
-            rssi, snr, size, crc_status, frame_type, dev_addr, hex_payload);
+            rssi, snr, size, crc_status, rf_chain, if_chain, frame_type, dev_addr, hex_payload);
     fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
 }
