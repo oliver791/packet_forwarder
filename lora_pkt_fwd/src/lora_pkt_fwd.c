@@ -2082,10 +2082,13 @@ void thread_up(void) {
 
 void thread_interf(void) {
 
+    int result = LGW_HAL_SUCCESS;
     struct lgw_pkt_tx_s tx_pkt;
     uint8_t tx_status;
     int i;
-    uint32_t tx_success = 0, tx_skip = 0;
+    struct timespec timer_start = {0}, timer_stop, loop_timer;
+    uint32_t toa_ms, period_ms, idle_ms, initial_wait_ms;
+    uint64_t tx_success = 0, tx_skip = 0, err_status = 0, err_send = 0;
     
     /* ========== CHECK : thread activé ========== */
     if (interf_duty_cycle == 0) {
@@ -2115,7 +2118,7 @@ void thread_interf(void) {
 
     /* ========== CALCUL DES PARAMÈTRES TEMPORELS ========== */
     /* Utilisation de la fonction officielle du HAL Semtech toa  */
-    uint32_t toa_ms = lgw_time_on_air(&tx_pkt);
+    toa_ms = lgw_time_on_air(&tx_pkt);
 
     if (toa_ms == 0) {
         MSG("ERROR: lgw_time_on_air() returned 0, aborting interference thread\n");
@@ -2124,10 +2127,10 @@ void thread_interf(void) {
 
     /* Période totale d'un cycle (ms) : ToA + silence */
     /* Formule : period = ToA / DC */
-    uint32_t period_ms = (uint32_t)((double)toa_ms * 100.0 / interf_duty_cycle);
+    period_ms = (uint32_t)((double)toa_ms * 100.0 / interf_duty_cycle);
 
     /* Temps de silence à attendre après chaque émission */
-    uint32_t idle_ms = (period_ms > toa_ms) ? (period_ms - toa_ms) : 0;
+    idle_ms = (period_ms > toa_ms) ? (period_ms - toa_ms) : 0;
 
     MSG("INFO: interference thread started\n");
     MSG("INFO: SF=%u, payload=%u B -> ToA=%u ms (from lgw_time_on_air)\n",
@@ -2139,28 +2142,54 @@ void thread_interf(void) {
 
     /* ========== BOUCLE PRINCIPALE ========== */
     while (!exit_sig && !quit_sig) {
+
+        /* Vérifier que le TX est libre (section critique check status + send) */
+        pthread_mutex_lock(&mx_concent);
+        result = lgw_status(TX_STATUS, &tx_status);
+        pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+
+        if (result == LGW_HAL_ERROR) {
+            MSG("WARNING: interference lgw_status() failed\n");
+            err_status++;
+            /// TODO: log something to file?
+        } else {
+            if (tx_status == TX_EMITTING) {
+                tx_skip++;
+                continue;
+            }
+        }
+
+        /* Measure loop time duration */
+        if (timer_start.tv_sec > 0 || timer_start.tv_nsec > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &timer_stop);
+            loop_timer.tv_sec = timer_start.tv_sec - timer_stop.tv_sec;
+            loop_timer.tv_nsec = timer_start.tv_nsec - timer_stop.tv_nsec;
+            if (loop_timer.tv_nsec < 0) {
+                --loop_timer.tv_sec;
+                loop_timer.tv_nsec += 1000000000;
+            }
+            MSG("INTERF: last loop total duration %.3lf ms, toa=%u ms\n",
+                (double)loop_timer.tv_sec * 1000 + (double)loop_timer.tv_nsec / 1000000,
+                toa_ms);
+
+        }
+        clock_gettime(CLOCK_MONOTONIC, &timer_start);
         
+        /* Random initial wait between 0 and idle_ms */
+        if (idle_ms > 0)
+        {
+            initial_wait_ms = rand() % (idle_ms + 1);
+            wait_ms((unsigned long)initial_wait_ms);
+        }
 
         /* Remplir le payload avec des données aléatoires */
         for (i = 0; i < (int)tx_pkt.size; i++) {
             tx_pkt.payload[i] = (uint8_t)(rand() % 256);
         }
 
-        /* Vérifier que le TX est libre (section critique check status + send) */
-        pthread_mutex_lock(&mx_concent);
-        lgw_status(TX_STATUS, &tx_status);
-
-        if (tx_status == TX_EMITTING) {
-            pthread_mutex_unlock(&mx_concent);
-            tx_skip++;
-            continue;
-        }
-        //wait_ms (random entre 0 et contenu var idle_ms)
-        //
         /* Envoyer le paquet */
-        //
-        int result = lgw_send(tx_pkt);
-        //
+        pthread_mutex_lock(&mx_concent);
+        result = lgw_send(tx_pkt);
         pthread_mutex_unlock(&mx_concent);
 
         if (result == LGW_HAL_SUCCESS) {
@@ -2184,17 +2213,19 @@ void thread_interf(void) {
             );
         } else {
             MSG("WARNING: interference lgw_send() failed\n");
+            err_send++;
+            /// TODO: log something to file?
         }
 
-        //usleep(period_ms * 1000); 
-        //wait(period_ms);
-        //wait(idle_ms);
-
-        wait_ms((unsigned long)idle_ms);
+        /* Remaining initial wait between 0 and idle_ms */
+        if (idle_ms > 0 && idle_ms > initial_wait_ms)
+        {
+            wait_ms((unsigned long)(idle_ms - initial_wait_ms));
+        }
     }
 
-    MSG("INFO: interference thread stopped - final: %u sent, %u skipped\n",
-        tx_success, tx_skip);
+    MSG("INFO: interference thread stopped - final: %lu sent, %lu skipped, %lu err_status, %lu err_send\n",
+        tx_success, tx_skip, err_status, err_send);
 }
 
 
