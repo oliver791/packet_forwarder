@@ -2162,8 +2162,8 @@ void thread_interf(void) {
         /* Measure loop time duration */
         if (timer_start.tv_sec > 0 || timer_start.tv_nsec > 0) {
             clock_gettime(CLOCK_MONOTONIC, &timer_stop);
-            loop_timer.tv_sec = timer_start.tv_sec - timer_stop.tv_sec;
-            loop_timer.tv_nsec = timer_start.tv_nsec - timer_stop.tv_nsec;
+            loop_timer.tv_sec = timer_stop.tv_sec - timer_start.tv_sec;
+            loop_timer.tv_nsec = timer_stop.tv_nsec - timer_start.tv_nsec;
             if (loop_timer.tv_nsec < 0) {
                 --loop_timer.tv_sec;
                 loop_timer.tv_nsec += 1000000000;
