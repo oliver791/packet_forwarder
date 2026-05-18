@@ -238,13 +238,6 @@ static struct lgw_tx_gain_lut_s txlut; /* TX gain table */
 static uint32_t tx_freq_min[LGW_RF_CHAIN_NB]; /* lowest frequency supported by TX chain */
 static uint32_t tx_freq_max[LGW_RF_CHAIN_NB]; /* highest frequency supported by TX chain */
 
-/* -------------------- AUTO-DL PARAMETERS -------------------- */
-static bool     auto_dl_mode      = false;           /* false = normal, true = auto-DL */
-static int      auto_rf_power     = 14;              /* default 14 dBm      */
-static uint32_t auto_datarate     = DR_LORA_SF7;     /* default SF7         */
-static uint32_t auto_freq_hz      = 868100000;       /* default 868.1 MHz   */
-static uint16_t auto_payload_size = 255;             /* default 255 octets  */
-
 /* ----------------- INTERFERENCE PARAMETERS ------------------ */
 static uint32_t interf_duty_cycle = 0;   /* en pourcentage (0 = désactivé) */
 static int      interf_rf_power     = 14;        /* dBm */
@@ -923,7 +916,7 @@ static const char *ftype_str[] = {
 
 static void log_csv_header(void) {
     if (log_file) {
-        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,radio,demodulator,frame_type,dev_addr,payload_hex\n");
+        fprintf(log_file, "pkt_num,timestamp,direction,freq_mhz,sf,rf_power,rssi,snr,size,crc,radio,demodulator,frame_type,dev_addr,agc_gain,bb_rssi,payload_hex\n");
         fflush(log_file);
     }
 }
@@ -931,7 +924,8 @@ static void log_csv_header(void) {
 static void log_packet_csv(const char *direction, double freq_mhz, int sf, int rf_power,
                            float rssi, float snr, int size, const char *crc_status,
                            int rf_chain, int if_chain,
-                           const uint8_t *payload, int payload_size) {
+                           const uint8_t *payload, int payload_size, 
+                           int32_t agc_gain, int32_t bb_rssi) {
     if (!log_file) return;
 
     /* Horodatage */
@@ -971,9 +965,9 @@ static void log_packet_csv(const char *direction, double freq_mhz, int sf, int r
 
     pthread_mutex_lock(&log_mutex);
     pkt_counter++;
-    fprintf(log_file, "%u,%s,%s,%.3f,%d,%d,%.1f,%.1f,%d,%s,%d,%d,%s,%08X,%s\n",
+    fprintf(log_file, "%u,%s,%s,%.3f,%d,%d,%.1f,%.1f,%d,%s,%d,%d,%s,%08X,%d,%d,%s\n",
             pkt_counter, time_str, direction, freq_mhz, sf, rf_power,
-            rssi, snr, size, crc_status, rf_chain, if_chain, frame_type, dev_addr, hex_payload);
+            rssi, snr, size, crc_status, rf_chain, if_chain, frame_type, dev_addr, agc_gain, bb_rssi, hex_payload);
     fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
 }
@@ -1022,6 +1016,20 @@ static void log_packet_csv(const char *direction, double freq_mhz, int sf, int r
     double t_payload_ms  = n_symb_payload * ts_ms;
 
     return t_preamble_ms + t_payload_ms;
+}
+
+/* --- Lecture combinée AGC_GAIN + BB_RSSI du SX1301 ----------------------- */
+
+static void read_agc_state(int32_t *agc_gain, int32_t *bb_rssi) {
+    int x1, x2;
+    *agc_gain = -1;
+    *bb_rssi  = -1;
+    pthread_mutex_lock(&mx_concent);
+    x1 = lgw_reg_r(LGW_CHANN_AGC_GAIN, agc_gain);
+    x2 = lgw_reg_r(LGW_BB_RSSI,        bb_rssi);
+    pthread_mutex_unlock(&mx_concent);
+    if (x1 != LGW_REG_SUCCESS) *agc_gain = -1;
+    if (x2 != LGW_REG_SUCCESS) *bb_rssi  = -1;
 }
 
 
@@ -1501,10 +1509,6 @@ if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0))
         printf("# PUSH_DATA datagrams sent: %u (%u bytes)\n", cp_up_dgram_sent, cp_up_network_byte);
         printf("# PUSH_DATA acknowledged: %.2f%%\n", 100.0 * up_ack_ratio);
         printf("### [DOWNSTREAM] ###\n");
-        if (auto_dl_mode) {
-            printf("# MODE: AUTO-DL (continuous, freq=%u, %s, pw=%d, size=%u)\n",
-                   auto_freq_hz, sf_to_str(auto_datarate), auto_rf_power, auto_payload_size);
-        }
         printf("# PULL_DATA sent: %u (%.2f%% acknowledged)\n", cp_dw_pull_sent, 100.0 * dw_ack_ratio);
         printf("# PULL_RESP(onse) datagrams received: %u (%u bytes)\n", cp_dw_dgram_rcv, cp_dw_network_byte);
         printf("# RF packets sent to concentrator: %u (%u bytes)\n", (cp_nb_tx_ok+cp_nb_tx_fail), cp_dw_payload_byte);
@@ -1612,6 +1616,8 @@ if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0))
 void thread_up(void) {
     int i, j; /* loop variables */
     unsigned pkt_in_dgram; /* nb on Lora packet in the current datagram */
+    int32_t agc_gain_rx = -1;
+    int32_t bb_rssi_rx  = -1;
 
     /* allocate memory for packet fetching and processing */
     struct lgw_pkt_rx_s rxpkt[NB_PKT_MAX]; /* array containing inbound packets + metadata */
@@ -1667,6 +1673,10 @@ void thread_up(void) {
         pthread_mutex_lock(&mx_concent);
         nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
         pthread_mutex_unlock(&mx_concent);
+        
+        /* === AGC SNAPSHOT ==== */
+        read_agc_state(&agc_gain_rx, &bb_rssi_rx);
+
         if (nb_pkt == LGW_HAL_ERROR) {
             MSG("ERROR: [up] failed packet fetch, exiting\n");
             exit(EXIT_FAILURE);
@@ -1771,7 +1781,7 @@ void thread_up(void) {
                     "UP",
                     (double)p->freq_hz / 1e6,
                     sf_val,
-                    0,              /* rf_power : N/A pour uplink */
+                    0,                     /* rf_power : N/A pour uplink */
                     p->rssi,
                     p->snr,
                     (int)p->size,
@@ -1779,7 +1789,8 @@ void thread_up(void) {
                     (int)p->rf_chain,      /* 0 = radio_0, 1 = radio_1 */
                     (int)p->if_chain,      /* 0-9 = numéro démodulateur */
                     p->payload,
-                    (int)p->size
+                    (int)p->size,
+                    agc_gain_rx, bb_rssi_rx                 /* agc gain et bb_rssi enregistre cote RX */
                 );
             }
 
@@ -2076,6 +2087,7 @@ void thread_up(void) {
     MSG("\nINFO: End of upstream thread\n");
 }
 
+
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 /* --- THREAD 2 INTERFERENCE TX --- */
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -2088,7 +2100,9 @@ void thread_interf(void) {
     int i;
     struct timespec timer_start = {0}, timer_stop, loop_timer;
     uint32_t toa_ms, period_ms, idle_ms, initial_wait_ms;
-    uint64_t tx_success = 0, tx_skip = 0, err_status = 0, err_send = 0;
+    uint64_t tx_success = 0, tx_skip = 0, tx_skipByLoop = 0, err_status = 0, err_send = 0;
+    int32_t agc_gain = -1;   /* gain AGC firmware */
+    int32_t bb_rssi  = -1;   /* RSSI baseband     */
     
     /* ========== CHECK : thread activé ========== */
     if (interf_duty_cycle == 0) {
@@ -2144,9 +2158,9 @@ void thread_interf(void) {
     while (!exit_sig && !quit_sig) {
 
         /* Vérifier que le TX est libre (section critique check status + send) */
-        pthread_mutex_lock(&mx_concent);
+        //pthread_mutex_lock(&mx_concent);
         result = lgw_status(TX_STATUS, &tx_status);
-        pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+        //pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
 
         if (result == LGW_HAL_ERROR) {
             MSG("WARNING: interference lgw_status() failed\n");
@@ -2155,9 +2169,14 @@ void thread_interf(void) {
         } else {
             if (tx_status == TX_EMITTING) {
                 tx_skip++;
+                tx_skipByLoop++;
+                //wait_ms(1); // pour eviter que le thread garde la main trop longtemps avec le mutex initial 4
                 continue;
             }
         }
+
+        printf("*** Skip By loop : %d ***\n\n",tx_skipByLoop);
+        tx_skipByLoop = 0;
 
         /* Measure loop time duration */
         if (timer_start.tv_sec > 0 || timer_start.tv_nsec > 0) {
@@ -2188,13 +2207,16 @@ void thread_interf(void) {
         }
 
         /* Envoyer le paquet */
-        pthread_mutex_lock(&mx_concent);
+        //pthread_mutex_lock(&mx_concent);
         result = lgw_send(tx_pkt);
-        pthread_mutex_unlock(&mx_concent);
+        //pthread_mutex_unlock(&mx_concent);
+
+        /* ====== AGC SNAPSHOT ====== */
+         //read_agc_state(&agc_gain, &bb_rssi);
 
         if (result == LGW_HAL_SUCCESS) {
             tx_success++;
-            MSG("INTERF: packet sent on %.3f MHz\n", tx_pkt.freq_hz / 1e6);
+            MSG("INTERF: packet sent on %.3f MHz | AGC_GAIN=%d | BB_RSSI=%d\n", tx_pkt.freq_hz / 1e6, agc_gain, bb_rssi);
 
             /* Logger dans le CSV */
             log_packet_csv(
@@ -2209,7 +2231,10 @@ void thread_interf(void) {
                 (int)tx_pkt.rf_chain,              /* rf_chain */
                 -1,                                /* if_chain : N/A pour TX */
                 tx_pkt.payload,                    /* payload */
-                (int)tx_pkt.size                   /* payload_size */
+                (int)tx_pkt.size,                   /* payload_size */
+                agc_gain,                          /* gain AGC firmware     */
+                bb_rssi                            /* RSSI baseband SX1301  */
+                
             );
         } else {
             MSG("WARNING: interference lgw_send() failed\n");
