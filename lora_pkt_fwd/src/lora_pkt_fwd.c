@@ -2092,18 +2092,104 @@ void thread_up(void) {
 /* --- THREAD 2 INTERFERENCE TX --- */
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 
+int32_t lora_bw_getval(int x) {
+    switch (x) {
+        case BW_500KHZ: return 500000;
+        case BW_250KHZ: return 250000;
+        case BW_125KHZ: return 125000;
+        case BW_62K5HZ: return 62500;
+        case BW_31K2HZ: return 31200;
+        case BW_15K6HZ: return 15600;
+        case BW_7K8HZ : return 7800;
+        default: return -1;
+    }
+}
+
+int32_t lora_sf_getval(int x) {
+    switch (x) {
+        case DR_LORA_SF7: return 7;
+        case DR_LORA_SF8: return 8;
+        case DR_LORA_SF9: return 9;
+        case DR_LORA_SF10: return 10;
+        case DR_LORA_SF11: return 11;
+        case DR_LORA_SF12: return 12;
+        default: return -1;
+    }
+}
+
+double lora_time_on_air_s(struct lgw_pkt_tx_s *packet) {
+    int32_t val;
+    uint8_t SF, H, DE;
+    uint32_t BW, payloadSymbNb;
+    double Tsym, Tpreamble, Tpayload, Tfsk, Tpacket;
+
+    if (packet == NULL) {
+        return 0;
+    }
+
+    if (packet->modulation == MOD_LORA) {
+        /* Get bandwidth */
+        val = lora_bw_getval(packet->bandwidth);
+        if (val != -1) {
+            BW = (uint32_t)val;
+        } else {
+            return 0;
+        }
+
+        /* Get datarate */
+        val = lora_sf_getval(packet->datarate);
+        if (val != -1) {
+            SF = (uint8_t)val;
+        } else {
+            return 0;
+        }
+
+        /* Duration of 1 symbol */
+        Tsym = pow(2, SF) / BW;
+
+        /* Duration of preamble */
+        Tpreamble = ((double)(packet->preamble) + 4.25) * Tsym;
+
+        /* Duration of payload */
+        H = (packet->no_header==false) ? 0 : 1; /* header is always enabled, except for beacons */
+        DE = (SF >= 11) ? 1 : 0; /* Low datarate optimization enabled for SF11 and SF12 */
+
+        payloadSymbNb = 8 + (ceil((double)(8*packet->size - 4*SF + 28 + 16 - 20*H) / (double)(4*(SF - 2*DE))) * (packet->coderate + 4)); /* Explicitely cast to double to keep precision of the division */
+
+        Tpayload = payloadSymbNb * Tsym;
+
+        /* Duration of packet */
+        Tpacket = Tpreamble + Tpayload;
+    } else {
+        Tpacket = 0;
+    }
+
+    return Tpacket;
+}
+
+void wait_ns(uint64_t a) {
+    struct timespec dly = {
+        .tv_sec = (long)(a / 1000000000),
+        .tv_nsec = a % 1000000000
+    };
+    if((dly.tv_sec > 0) || ((dly.tv_sec == 0) && (dly.tv_nsec > 100000))) {
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &dly, NULL);
+    }
+    return;
+}
+
 void thread_interf(void) {
 
     int result = LGW_HAL_SUCCESS;
     struct lgw_pkt_tx_s tx_pkt;
     uint8_t tx_status;
     int i;
-    struct timespec timer_start = {0}, timer_stop, loop_timer;
-    uint32_t toa_ms, period_ms, idle_ms, initial_wait_ms;
-    uint64_t tx_success = 0, tx_skip = 0, tx_skipByLoop = 0, err_status = 0, err_send = 0;
+    uint64_t toa_ns = 0, idle_ns = 0, initial_delay_ns = 0;
+    uint64_t tx_success = 0, tx_skip = 0, tx_skip_loop = 0, err_status = 0, err_send = 0;
+    struct timespec timer_start = {0}, timer_stop;
     int32_t agc_gain = -1;   /* gain AGC firmware */
     int32_t bb_rssi  = -1;   /* RSSI baseband     */
-    
+
     /* ========== CHECK : thread activé ========== */
     if (interf_duty_cycle == 0) {
         MSG("INFO: interference thread disabled (use -d <duty_cycle_percent>)\n");
@@ -2132,73 +2218,67 @@ void thread_interf(void) {
 
     /* ========== CALCUL DES PARAMÈTRES TEMPORELS ========== */
     /* Utilisation de la fonction officielle du HAL Semtech toa  */
-    toa_ms = lgw_time_on_air(&tx_pkt);
+    toa_ns = (uint64_t)(lora_time_on_air_s(&tx_pkt) * 1e9);
 
-    if (toa_ms == 0) {
+    if (toa_ns == 0) {
         MSG("ERROR: lgw_time_on_air() returned 0, aborting interference thread\n");
         return;
     }
 
-    /* Période totale d'un cycle (ms) : ToA + silence */
-    /* Formule : period = ToA / DC */
-    period_ms = (uint32_t)((double)toa_ms * 100.0 / interf_duty_cycle);
-
-    /* Temps de silence à attendre après chaque émission */
-    idle_ms = (period_ms > toa_ms) ? (period_ms - toa_ms) : 0;
+    /* Desired duty-cycle downtime (not transmitting) */
+    idle_ns = (uint64_t)(100.0 / (double)interf_duty_cycle - 1.0) * toa_ns;
 
     MSG("INFO: interference thread started\n");
-    MSG("INFO: SF=%u, payload=%u B -> ToA=%u ms (from lgw_time_on_air)\n",
-        sf_to_int(interf_datarate), interf_payload_size, toa_ms);
-    MSG("INFO: DC target=%u%% -> period=%u ms (idle=%u ms)\n",
-        interf_duty_cycle, period_ms, idle_ms);
+    MSG("INFO: SF=%u, payload=%u B -> ToA=%.3lf ms (from lgw_time_on_air)\n",
+        sf_to_int(interf_datarate),
+        interf_payload_size,
+        (double)toa_ns / 1e6);
+    MSG("INFO: DC target=%u%%, actual=%f%% -> period=%.3lf ms (idle=%.3lf ms)\n",
+        interf_duty_cycle, (double)toa_ns / (idle_ns + toa_ns + 2500000),
+        (double)(toa_ns + idle_ns) / 1e6, 
+        (double)idle_ns / 1e6);
 
-    srand((unsigned int)time(NULL));   
+    srand((unsigned int)time(NULL));
 
     /* ========== BOUCLE PRINCIPALE ========== */
     while (!exit_sig && !quit_sig) {
 
-        /* Vérifier que le TX est libre (section critique check status + send) */
-        //pthread_mutex_lock(&mx_concent);
+        /* Verify that the concentrator is free to transmit */
+        pthread_mutex_lock(&mx_concent);
         result = lgw_status(TX_STATUS, &tx_status);
-        //pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+        pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
 
         if (result == LGW_HAL_ERROR) {
             MSG("WARNING: interference lgw_status() failed\n");
             err_status++;
-            /// TODO: log something to file?
         } else {
             if (tx_status == TX_EMITTING) {
-                tx_skip++;
-                tx_skipByLoop++;
-                //wait_ms(1); // pour eviter que le thread garde la main trop longtemps avec le mutex initial 4
+                tx_skip++; tx_skip_loop++;
+                wait_ns(500000); // 0.5 ms
                 continue;
             }
         }
 
-        printf("*** Skip By loop : %d ***\n\n",tx_skipByLoop);
-        tx_skipByLoop = 0;
+        printf("*** Skip By loop : %lu ***\n\n", tx_skip_loop);
+        tx_skip_loop = 0;
 
         /* Measure loop time duration */
         if (timer_start.tv_sec > 0 || timer_start.tv_nsec > 0) {
             clock_gettime(CLOCK_MONOTONIC, &timer_stop);
-            loop_timer.tv_sec = timer_stop.tv_sec - timer_start.tv_sec;
-            loop_timer.tv_nsec = timer_stop.tv_nsec - timer_start.tv_nsec;
-            if (loop_timer.tv_nsec < 0) {
-                --loop_timer.tv_sec;
-                loop_timer.tv_nsec += 1000000000;
-            }
-            MSG("INTERF: last loop total duration %.3lf ms, toa=%u ms\n",
-                (double)loop_timer.tv_sec * 1000 + (double)loop_timer.tv_nsec / 1000000,
-                toa_ms);
-
+            MSG("INTERF: last loop total duration %.3lf ms, toa=%.3lf ms\n",
+                (double)(timer_stop.tv_sec - timer_start.tv_sec) * 1e3 +
+                (double)(timer_stop.tv_nsec - timer_start.tv_nsec) / 1e6,
+                (double)toa_ns / 1e6);
         }
         clock_gettime(CLOCK_MONOTONIC, &timer_start);
         
         /* Random initial wait between 0 and idle_ms */
-        if (idle_ms > 0)
+        if (idle_ns > 0)
         {
-            initial_wait_ms = rand() % (idle_ms + 1);
-            wait_ms((unsigned long)initial_wait_ms);
+            initial_delay_ns = rand() % (idle_ns + 1);
+            wait_ns(initial_delay_ns);
+        } else {
+            initial_delay_ns = 0;
         }
 
         /* Remplir le payload avec des données aléatoires */
@@ -2207,16 +2287,13 @@ void thread_interf(void) {
         }
 
         /* Envoyer le paquet */
-        //pthread_mutex_lock(&mx_concent);
+        pthread_mutex_lock(&mx_concent);
         result = lgw_send(tx_pkt);
-        //pthread_mutex_unlock(&mx_concent);
-
-        /* ====== AGC SNAPSHOT ====== */
-         //read_agc_state(&agc_gain, &bb_rssi);
+        pthread_mutex_unlock(&mx_concent);
 
         if (result == LGW_HAL_SUCCESS) {
             tx_success++;
-            MSG("INTERF: packet sent on %.3f MHz | AGC_GAIN=%d | BB_RSSI=%d\n", tx_pkt.freq_hz / 1e6, agc_gain, bb_rssi);
+            MSG("INTERF: packet sent on %.3f MHz\n", tx_pkt.freq_hz / 1e6);
 
             /* Logger dans le CSV */
             log_packet_csv(
@@ -2239,14 +2316,10 @@ void thread_interf(void) {
         } else {
             MSG("WARNING: interference lgw_send() failed\n");
             err_send++;
-            /// TODO: log something to file?
         }
 
-        /* Remaining initial wait between 0 and idle_ms */
-        if (idle_ms > 0 && idle_ms > initial_wait_ms)
-        {
-            wait_ms((unsigned long)(idle_ms - initial_wait_ms));
-        }
+        /* Wait-out processing delay (2.5 ms) + packet TX + remaining duty-cycle */
+        wait_ns(2500000 + toa_ns + (idle_ns - initial_delay_ns));
     }
 
     MSG("INFO: interference thread stopped - final: %lu sent, %lu skipped, %lu err_status, %lu err_send\n",
